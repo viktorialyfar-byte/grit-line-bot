@@ -50,16 +50,23 @@ EQUIPMENT_CATALOG = {
         "label": "Dingo Mini Skid Steer + 5x10 Utility Trailer",
         "rental_price_id": "price_1U6IRkFNCgHCBzebRLQBpaYe",
         "deposit_price_id": "price_1U6IRlFNCgHCBzebiqxjKy5V",
+        # Self-propelled construction equipment — WA Heavy Equipment Rental Tax (RCW 82.51) applies.
+        "heavy_equipment": True,
     },
     "trailer_22ft": {
         "label": "22ft Equipment/Auto Trailer",
         "rental_price_id": "price_1U6YxKFNCgHCBzeb6FxkG02t",
         "deposit_price_id": "price_1U6YxMFNCgHCBzebQifqFWfX",
+        # Plain towed trailer, no powered equipment — not "heavy equipment" under RCW 82.51 / 84.36.597
+        # (that definition targets self-propelled machinery; licensed/registered trailers fall outside it).
+        "heavy_equipment": False,
     },
     "dump_trailer_5x10": {
         "label": "5x10 Dump Trailer",
         "rental_price_id": "price_1U6YxGFNCgHCBzebjjs2c4AU",
         "deposit_price_id": "price_1U6YxIFNCgHCBzebyUeXFUnK",
+        # Plain towed trailer, no powered equipment — same reasoning as above.
+        "heavy_equipment": False,
     },
 }
 
@@ -75,7 +82,16 @@ def tg_send(chat_id, text):
 # ---------------------------------------------------------------------------
 # Claude — parse freeform job text into structured fields
 # ---------------------------------------------------------------------------
-PARSE_SCHEMA_HINT = """Extract these fields from the renter's message as JSON. Use null for anything not mentioned.
+PARSE_SCHEMA_HINT = """You're reading a message from Viktoria, who runs Grit Line Rentals, describing a
+new equipment rental job. Her message will NOT necessarily follow any particular format or order —
+it might be a quick note, a copy-pasted text/email thread with a customer, shorthand, or a message
+with extra chit-chat, greetings, or unrelated commentary mixed in. Read the whole thing and pull out
+whatever matches the fields below, wherever it appears and in whatever words she used (e.g. "he's
+grabbing it himself" means renter_pickup; "drop it at the site" means delivery). Ignore anything that
+isn't one of these fields — don't let unrelated text confuse the extraction, and don't force a field
+that truly isn't there (leave it null instead of guessing).
+
+Extract these fields as JSON. Use null for anything not mentioned.
 {
 "renter_name": string,
 "renter_email": string,
@@ -94,9 +110,9 @@ PARSE_SCHEMA_HINT = """Extract these fields from the renter's message as JSON. U
 }
 Grit Line's standard rates (Spokane County sales tax + WA Heavy Equipment
 Rental Tax) are applied automatically — leave "sales_tax_pct" and
-"heavy_equipment_tax_pct" null unless the renter's message explicitly
-overrides them (e.g. states different rates, or says the job is tax-exempt /
-out of state / no tax, in which case use 0).
+"heavy_equipment_tax_pct" null unless Viktoria's message explicitly overrides
+them (e.g. states different rates, or says the job is tax-exempt / out of
+state / no tax, in which case use 0).
 Respond with ONLY the JSON object, no other text."""
 
 def claude_parse(text):
@@ -183,7 +199,9 @@ def build_invoice(job, equipment):
         sales_tax_pct = DEFAULT_SALES_TAX_PCT
     heavy_tax_pct = job.get("heavy_equipment_tax_pct")
     if heavy_tax_pct is None:
-        heavy_tax_pct = DEFAULT_HEAVY_EQUIPMENT_TAX_PCT
+        # Only self-propelled equipment (e.g. the skid steer) is "heavy equipment" under RCW 82.51 —
+        # plain towed trailers rented on their own don't qualify, so default to 0 for those.
+        heavy_tax_pct = DEFAULT_HEAVY_EQUIPMENT_TAX_PCT if equipment.get("heavy_equipment") else 0
     # record the rates actually applied, for the confirmation message + saved state
     job["sales_tax_pct"] = sales_tax_pct
     job["heavy_equipment_tax_pct"] = heavy_tax_pct
@@ -243,6 +261,16 @@ def docuseal_request(method, path, body=None):
         err_body = e.read().decode(errors="replace")
         raise RuntimeError(f"DocuSeal {method} {path} -> {e.code}: {err_body}") from None
 
+def _phone_email_value(job):
+    """The template has a single combined "Phone Email" field. Don't let one
+    silently overwrite the other — show whichever fields the renter actually
+    gave us, so nothing Viktoria sent gets dropped from the printed contract."""
+    phone = job.get("renter_phone")
+    email = job.get("renter_email")
+    if phone and email:
+        return f"{phone} / {email}"
+    return phone or email or ""
+
 def build_docuseal_submission(job, equipment):
     pickup_true = job["pickup_method"] == "renter_pickup"
     payload = {
@@ -255,7 +283,7 @@ def build_docuseal_submission(job, equipment):
                 "email": GMAIL_ADDRESS,
                 "fields": [
                     {"name": "Renter Name", "value": job["renter_name"]},
-                    {"name": "Phone Email", "value": job.get("renter_phone") or job["renter_email"]},
+                    {"name": "Phone Email", "value": _phone_email_value(job)},
                     {"name": "Job Site Address", "value": job.get("job_site_address", "")},
                     {"name": "Equipment Rented", "value": equipment["label"]},
                     {"name": "Date Time Out", "value": job["date_out"]},
