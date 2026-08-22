@@ -38,6 +38,7 @@ GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 
 DOCUSEAL_TEMPLATE_ID = 5505336
+DEFAULT_TAX_PCT = 10.5  # Spokane County sales tax + WA Heavy Equipment Rental Tax, combined (per Viktoria, 2026-08-21)
 STATE_FILE = Path("/tmp/pending_job.json")  # survives until the dyno restarts; good enough for single-user low-volume use
 
 EQUIPMENT_CATALOG = {
@@ -84,9 +85,13 @@ PARSE_SCHEMA_HINT = """Extract these fields from the renter's message as JSON. U
 "security_deposit": number or null,
 "pickup_method": "renter_pickup" or "delivery",
 "delivery_amount": number or null,
-"sales_tax_pct": number or null,
-"heavy_equipment_tax_pct": number or null
+"sales_tax_pct": number or null
 }
+Grit Line's standard combined tax rate (Spokane County sales tax + WA Heavy
+Equipment Rental Tax) is applied automatically — leave "sales_tax_pct" null
+unless the renter's message explicitly overrides it (e.g. states a different
+rate, or says the job is tax-exempt / out of state / no tax, in which case
+use 0).
 Respond with ONLY the JSON object, no other text."""
 
 def claude_parse(text):
@@ -118,7 +123,7 @@ def _coerce_numeric_fields(job):
     "$175.00", coerce it here instead of crashing later on an f-string
     format spec or an arithmetic op."""
     for key in ("rental_rate_day", "security_deposit", "delivery_amount",
-                "sales_tax_pct", "heavy_equipment_tax_pct"):
+                "sales_tax_pct"):
         val = job.get(key)
         if isinstance(val, str):
             cleaned = val.replace("$", "").replace(",", "").strip()
@@ -165,10 +170,13 @@ def build_invoice(job, equipment):
 
     rental_cents = round(job["rental_rate_day"] * 100)
     deposit_cents = round((job.get("security_deposit") or 0) * 100)
-    sales_tax_pct = job.get("sales_tax_pct") or 0
-    heavy_tax_pct = job.get("heavy_equipment_tax_pct") or 0
-    sales_tax_cents = round(rental_cents * sales_tax_pct / 100)
-    heavy_tax_cents = round(rental_cents * heavy_tax_pct / 100)
+    # Grit Line's standard combined rate applies automatically unless the
+    # renter's message explicitly gave a different rate (parsed onto the job).
+    tax_pct = job.get("sales_tax_pct")
+    if tax_pct is None:
+        tax_pct = DEFAULT_TAX_PCT
+    job["sales_tax_pct"] = tax_pct  # record the rate actually applied, for the confirmation message + saved state
+    tax_cents = round(rental_cents * tax_pct / 100)
 
     stripe_request("POST", "/invoiceitems", {
         "customer": customer_id,
@@ -176,15 +184,10 @@ def build_invoice(job, equipment):
         "currency": "usd",
         "description": f"{equipment['label']} rental — {job['date_out']} to {job['date_due']}",
     })
-    if sales_tax_cents:
+    if tax_cents:
         stripe_request("POST", "/invoiceitems", {
-            "customer": customer_id, "amount": sales_tax_cents, "currency": "usd",
-            "description": f"Sales Tax ({sales_tax_pct}%) on rental",
-        })
-    if heavy_tax_cents:
-        stripe_request("POST", "/invoiceitems", {
-            "customer": customer_id, "amount": heavy_tax_cents, "currency": "usd",
-            "description": f"WA Heavy Equipment Rental Tax ({heavy_tax_pct}%)",
+            "customer": customer_id, "amount": tax_cents, "currency": "usd",
+            "description": f"Sales Tax + WA Heavy Equipment Rental Tax ({tax_pct}%)",
         })
     if deposit_cents:
         stripe_request("POST", "/invoiceitems", {
@@ -383,8 +386,8 @@ def handle_message(chat_id, text):
     })
 
     tax_note = ""
-    if job.get("sales_tax_pct") or job.get("heavy_equipment_tax_pct"):
-        tax_note = f" (incl. {job.get('sales_tax_pct',0)}% sales tax + {job.get('heavy_equipment_tax_pct',0)}% equipment tax)"
+    if job.get("sales_tax_pct"):
+        tax_note = f" (incl. {job['sales_tax_pct']}% tax)"
 
     tg_send(chat_id,
         f"Draft ready for {job['renter_name']}:\n\n"
