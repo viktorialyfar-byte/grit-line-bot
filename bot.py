@@ -16,6 +16,7 @@ import json
 import os
 import smtplib
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from email.mime.text import MIMEText
@@ -29,7 +30,7 @@ app = Flask(__name__)
 # Config — all from environment variables, set these in Render's dashboard
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED_CHAT_ID = os.environ["ALLOWED_CHAT_ID"]          # your own Telegram chat id — messages from anyone else are ignored
+ALLOWED_CHAT_ID = os.environ["ALLOWED_CHAT_ID"]  # your own Telegram chat id — messages from anyone else are ignored
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 DOCUSEAL_API_KEY = os.environ["DOCUSEAL_API_KEY"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -37,7 +38,7 @@ GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 
 DOCUSEAL_TEMPLATE_ID = 5505336
-STATE_FILE = Path("/tmp/pending_job.json")   # survives until the dyno restarts; good enough for single-user low-volume use
+STATE_FILE = Path("/tmp/pending_job.json")  # survives until the dyno restarts; good enough for single-user low-volume use
 
 EQUIPMENT_CATALOG = {
     "dingo_trailer": {
@@ -57,7 +58,6 @@ EQUIPMENT_CATALOG = {
     },
 }
 
-
 # ---------------------------------------------------------------------------
 # Telegram helpers
 # ---------------------------------------------------------------------------
@@ -67,29 +67,27 @@ def tg_send(chat_id, text):
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10)
 
-
 # ---------------------------------------------------------------------------
 # Claude — parse freeform job text into structured fields
 # ---------------------------------------------------------------------------
 PARSE_SCHEMA_HINT = """Extract these fields from the renter's message as JSON. Use null for anything not mentioned.
 {
-  "renter_name": string,
-  "renter_email": string,
-  "renter_phone": string or null,
-  "drivers_license": string or null,
-  "job_site_address": string,
-  "equipment_key": one of "dingo_trailer" | "trailer_22ft" | "dump_trailer_5x10" | null,
-  "date_out": string (human readable, e.g. "Sat 08/22/2026 7:00 AM"),
-  "date_due": string,
-  "rental_rate_day": number,
-  "security_deposit": number or null,
-  "pickup_method": "renter_pickup" or "delivery",
-  "delivery_amount": number or null,
-  "sales_tax_pct": number or null,
-  "heavy_equipment_tax_pct": number or null
+"renter_name": string,
+"renter_email": string,
+"renter_phone": string or null,
+"drivers_license": string or null,
+"job_site_address": string,
+"equipment_key": one of "dingo_trailer" | "trailer_22ft" | "dump_trailer_5x10" | null,
+"date_out": string (human readable, e.g. "Sat 08/22/2026 7:00 AM"),
+"date_due": string,
+"rental_rate_day": number,
+"security_deposit": number or null,
+"pickup_method": "renter_pickup" or "delivery",
+"delivery_amount": number or null,
+"sales_tax_pct": number or null,
+"heavy_equipment_tax_pct": number or null
 }
 Respond with ONLY the JSON object, no other text."""
-
 
 def claude_parse(text):
     url = "https://api.anthropic.com/v1/messages"
@@ -114,6 +112,21 @@ def claude_parse(text):
         raw = raw.strip("`").split("\n", 1)[1] if "\n" in raw else raw
     return json.loads(raw)
 
+def _coerce_numeric_fields(job):
+    """Claude's parser is instructed to return numbers, but LLM output isn't
+    guaranteed — if a number ever comes back as a string like "175" or
+    "$175.00", coerce it here instead of crashing later on an f-string
+    format spec or an arithmetic op."""
+    for key in ("rental_rate_day", "security_deposit", "delivery_amount",
+                "sales_tax_pct", "heavy_equipment_tax_pct"):
+        val = job.get(key)
+        if isinstance(val, str):
+            cleaned = val.replace("$", "").replace(",", "").strip()
+            try:
+                job[key] = float(cleaned) if cleaned else None
+            except ValueError:
+                job[key] = None
+    return job
 
 # ---------------------------------------------------------------------------
 # Stripe helpers (raw REST calls, no SDK dependency)
@@ -132,9 +145,12 @@ def stripe_request(method, path, params=None):
                 pairs.append((k, v))
         data = urllib.parse.urlencode(pairs).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read())
-
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode(errors="replace")
+        raise RuntimeError(f"Stripe {method} {path} -> {e.code}: {err_body}") from None
 
 def find_or_create_customer(name, email, description=""):
     q = urllib.parse.quote(f"email:'{email}'")
@@ -143,7 +159,6 @@ def find_or_create_customer(name, email, description=""):
         return result["data"][0]["id"]
     created = stripe_request("POST", "/customers", {"name": name, "email": email, "description": description})
     return created["id"]
-
 
 def build_invoice(job, equipment):
     customer_id = find_or_create_customer(job["renter_name"], job["renter_email"], job.get("job_site_address", ""))
@@ -190,10 +205,8 @@ def build_invoice(job, equipment):
     total = finalized["amount_due"] / 100
     return finalized["id"], finalized["hosted_invoice_url"], total
 
-
 def void_invoice(invoice_id):
     stripe_request("POST", f"/invoices/{invoice_id}/void", {})
-
 
 # ---------------------------------------------------------------------------
 # DocuSeal helpers
@@ -203,9 +216,12 @@ def docuseal_request(method, path, body=None):
     headers = {"X-Auth-Token": DOCUSEAL_API_KEY, "Content-Type": "application/json"}
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read())
-
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode(errors="replace")
+        raise RuntimeError(f"DocuSeal {method} {path} -> {e.code}: {err_body}") from None
 
 def build_docuseal_submission(job, equipment):
     pickup_true = job["pickup_method"] == "renter_pickup"
@@ -248,7 +264,6 @@ def build_docuseal_submission(job, equipment):
     second_party = next(s for s in result if s["role"] == "Second Party")
     return second_party["embed_src"]
 
-
 # ---------------------------------------------------------------------------
 # Email (sent only after explicit "SEND" confirmation)
 # ---------------------------------------------------------------------------
@@ -281,24 +296,20 @@ Grit Line Equipment Rentals, LLC"""
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, [job["renter_email"]], msg.as_string())
 
-
 # ---------------------------------------------------------------------------
 # State (single pending job at a time — simple JSON file)
 # ---------------------------------------------------------------------------
 def save_pending(data):
     STATE_FILE.write_text(json.dumps(data))
 
-
 def load_pending():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
     return None
 
-
 def clear_pending():
     if STATE_FILE.exists():
         STATE_FILE.unlink()
-
 
 # ---------------------------------------------------------------------------
 # Webhook
@@ -322,7 +333,6 @@ def telegram_webhook():
     except Exception as e:
         tg_send(chat_id, f"⚠️ Something broke: {e}")
     return "ok"
-
 
 def handle_message(chat_id, text):
     upper = text.strip().upper()
@@ -350,6 +360,7 @@ def handle_message(chat_id, text):
     # Otherwise: treat as a new job.
     tg_send(chat_id, "Got it — working on it (this can take ~15-20 seconds)...")
     job = claude_parse(text)
+    job = _coerce_numeric_fields(job)
 
     missing = [f for f in ("renter_name", "renter_email", "job_site_address", "date_out", "date_due", "rental_rate_day")
                if not job.get(f)]
@@ -385,11 +396,9 @@ def handle_message(chat_id, text):
         f"Reply SEND to email {job['renter_email']}, or CANCEL to discard."
     )
 
-
 @app.route("/", methods=["GET"])
 def health():
     return "Grit Line bot is running."
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
