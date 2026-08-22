@@ -245,7 +245,7 @@ def build_docuseal_submission(job, equipment):
                     {"name": "Round Delivery", "value": not pickup_true},
                     {"name": "Round Delivery Amount",
                      "value": f"{job.get('delivery_amount') or 0:.2f}" if not pickup_true else "N/A"},
-                    {"name": "Security Deposit Checkbox", "value": False},
+                    {"name": "Security Deposit", "value": f"${job.get('security_deposit') or 0:.2f}"},
                 ],
             },
             {
