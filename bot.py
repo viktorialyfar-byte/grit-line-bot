@@ -165,6 +165,7 @@ Rules for "fields":
 - pickup_method: "he's grabbing it", "picking up", "customer pickup" -> "renter_pickup";
   "drop it off", "deliver", "bring it to the site", "delivering to <address>" -> "delivery".
   An address she's delivering to is the job_site_address.
+- security_deposit: an amount if she gives one; 0 if she says no deposit / skip it / waive it / none.
 - Money: plain numbers, no "$". "175 a day", "$175/day" -> 175.
 - Taxes: leave sales_tax_pct and heavy_equipment_tax_pct null unless she explicitly gives a different
   rate or says the job is tax-exempt / no tax / out of state (then 0).
@@ -263,9 +264,6 @@ def complete_job(draft):
     if equipment and not job.get("rental_rate_day"):
         job["rental_rate_day"] = equipment["default_rate"]
         assumptions.append(f"standard rate ${equipment['default_rate']:.0f}/day")
-    if equipment and job.get("security_deposit") is None:
-        job["security_deposit"] = equipment["default_deposit"]
-        assumptions.append(f"standard ${equipment['default_deposit']:.0f} deposit")
 
     if not job.get("pickup_method"):
         job["pickup_method"] = "renter_pickup"
@@ -304,6 +302,8 @@ def complete_job(draft):
             missing.append(label)
     if job["pickup_method"] == "delivery" and not job.get("job_site_address"):
         missing.append("delivery address")
+    if job.get("security_deposit") is None:
+        missing.append("deposit (an amount, or \"no deposit\")")
     return job, missing, assumptions
 
 
@@ -350,7 +350,8 @@ def summary_lines(job):
         lines.append(f"Delivery to: {job.get('job_site_address') or '?'} ({money(job.get('delivery_amount') or 0)})")
     else:
         lines.append("Customer pickup & return" + (f" — job site: {job['job_site_address']}" if job.get("job_site_address") else ""))
-    if job.get("security_deposit") is not None: lines.append(f"Deposit: {money(job['security_deposit'])}")
+    if job.get("security_deposit") is not None:
+        lines.append(f"Deposit: {money(job['security_deposit'])}" if job["security_deposit"] else "Deposit: none")
     return lines
 
 # ---------------------------------------------------------------------------
@@ -501,7 +502,7 @@ def build_docuseal_submission(job, equipment):
                     {"name": "Round Delivery", "value": not pickup_true},
                     {"name": "Round Delivery Amount",
                      "value": f"{job.get('delivery_amount') or 0:.2f}" if not pickup_true else "N/A"},
-                    {"name": "Security Deposit", "value": f"${job.get('security_deposit') or 0:.2f}"},
+                    {"name": "Security Deposit", "value": f"${job['security_deposit']:.2f}" if job.get("security_deposit") else "None"},
                 ],
             },
             {
